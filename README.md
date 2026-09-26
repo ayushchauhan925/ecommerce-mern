@@ -1,18 +1,18 @@
 # Ecommerce MERN
 
-A full-stack e-commerce platform: a Node.js/Express/TypeScript REST API backed by MySQL and Redis, paired with a Next.js/TypeScript storefront and admin dashboard. Handles product catalog browsing, cart, Stripe checkout, order tracking, reviews, and role-based admin management.
+A full-stack e-commerce platform: a Node.js/Express/JavaScript REST API backed by MySQL and Redis, paired with a Next.js/TypeScript storefront and admin dashboard. Handles product catalog browsing, cart, Stripe checkout, order tracking, reviews, and role-based admin management.
 
 ## Structure
 
 ```
 ecommerce-mern/
-├── backend/    Express + TypeScript + Prisma (MySQL) REST API
+├── backend/    Express + JavaScript + Prisma (MySQL) REST API
 └── frontend/   Next.js (App Router) + TypeScript storefront & admin panel
 ```
 
 ## Tech stack
 
-**Backend** — Node.js, Express, TypeScript, Prisma ORM (MySQL), Redis + BullMQ (background jobs), JWT auth, Stripe (payments), Cloudinary (image uploads), Zod (validation), Jest + Supertest (tests).
+**Backend** — Node.js, Express, JavaScript, Prisma ORM (MySQL), Redis + BullMQ (background jobs), JWT auth, Stripe (payments), Cloudinary (image uploads), Zod (validation), Jest + Supertest (tests).
 
 **Frontend** — Next.js (App Router), TypeScript, Tailwind CSS, React Query (server state), Zustand (auth/session state), React Hook Form + Zod (forms), Stripe.js / React Stripe Elements (checkout).
 
