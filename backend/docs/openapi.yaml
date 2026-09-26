@@ -1,0 +1,1812 @@
+openapi: 3.1.0
+
+info:
+  title: E-Commerce Backend API
+  version: 1.0.0
+  description: |
+    REST API for an e-commerce store: authentication, catalog, cart, orders,
+    Stripe payments, and purchase-verified reviews.
+
+    ## Response envelope
+    Every JSON endpoint (except the Stripe webhook) responds with:
+
+    | Outcome | Shape |
+    |---|---|
+    | Success | `{ "success": true, "message": string, "data": <payload or null> }` |
+    | Error   | `{ "success": false, "message": string, "errorCode": string }` |
+
+    `errorCode` is stable and machine-readable — branch on it, not on `message`.
+
+    ## Authentication
+    Send the access token from `/auth/login` or `/auth/register` as
+    `Authorization: Bearer <accessToken>`. Access tokens expire after 15 minutes;
+    exchange the refresh token (valid 7 days) at `/auth/refresh` for a new one.
+
+    Each operation states its requirement: **Public**, **Authenticated** (any
+    logged-in user), or **Admin only**. Admin-only operations are also marked
+    with `x-required-role: ADMIN`.
+
+    ## Errors common to every endpoint
+    | Status | errorCode | When |
+    |---|---|---|
+    | 400 | `VALIDATION_ERROR` | Body, query, or path params failed validation. `message` lists each failing field as `location.field: reason`. |
+    | 401 | `UNAUTHORIZED` / `INVALID_ACCESS_TOKEN` | Missing, malformed, or expired access token (protected endpoints only). |
+    | 403 | `FORBIDDEN` | Authenticated but not allowed (wrong role, or not the owner). |
+    | 404 | `ROUTE_NOT_FOUND` | No such endpoint. |
+    | 429 | `RATE_LIMIT_EXCEEDED` | Rate limit hit (see below). |
+    | 500 | `INTERNAL_ERROR` | Unexpected server error. |
+
+    ## Rate limits (per client IP)
+    - All `/api` endpoints: 100 requests / minute
+    - `POST /auth/register`, `POST /auth/login`: 10 requests / 15 minutes
+    - `POST /payments/create-intent`: 10 requests / minute
+
+    ## Not implemented
+    The forgot-password / reset-password flow from the original design was
+    **not built**; there are no endpoints for it. Password changes are not
+    currently supported through the API.
+
+servers:
+  - url: /api
+    description: This server
+
+tags:
+  - name: Health
+  - name: Auth
+    description: Registration, login, and token lifecycle.
+  - name: Users
+    description: Own profile, plus admin user management.
+  - name: Categories
+  - name: Products
+    description: Catalog browsing (public) and management (admin).
+  - name: Cart
+    description: The authenticated user's shopping cart.
+  - name: Orders
+    description: Checkout from cart, order history, and admin fulfilment.
+  - name: Payments
+    description: Stripe PaymentIntents and the Stripe webhook.
+  - name: Reviews
+    description: Product reviews, restricted to verified purchasers.
+
+paths:
+  # ───────────────────────────── Health ─────────────────────────────
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: '**Public.** Returns 200 when the API process is up.'
+      operationId: healthCheck
+      responses:
+        '200':
+          $ref: '#/components/responses/SuccessNoData'
+
+  # ────────────────────────────── Auth ──────────────────────────────
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register a new customer account
+      description: |
+        **Public.** Creates a `CUSTOMER` account and logs it in. The email is
+        trimmed and lower-cased before storage, so uniqueness is case-insensitive.
+        A welcome email is queued in the background.
+
+        Rate limited to 10 requests per 15 minutes per IP.
+      operationId: register
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 100, example: Ada Lovelace }
+                email: { type: string, format: email, example: ada@example.com }
+                password:
+                  type: string
+                  minLength: 8
+                  maxLength: 72
+                  description: 8–72 characters (bcrypt ignores anything past 72 bytes).
+                  example: Analytical-Engine-1843
+      responses:
+        '201':
+          description: Account created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/AuthResult' }
+              example:
+                success: true
+                message: Registration successful
+                data:
+                  user:
+                    id: 0b6f7c1e-3a52-4d8e-9f10-6c2d4b8a7e31
+                    name: Ada Lovelace
+                    email: ada@example.com
+                    role: CUSTOMER
+                  tokens:
+                    accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIwYjZmN2MxZSIsInJvbGUiOiJDVVNUT01FUiJ9.4Kx0V6H1q2
+                    refreshToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIwYjZmN2MxZSIsImp0aSI6IjdhMWMifQ.pQ3r8Zt0sL
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          description: Email already registered
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                message: Email is already registered
+                errorCode: EMAIL_ALREADY_EXISTS
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in
+      description: |
+        **Public.** Returns the user and a fresh access/refresh token pair. Each
+        login creates a separate session (refresh token); logging out of one
+        does not affect the others.
+
+        Unknown email and wrong password return the identical 401 response, so
+        this endpoint can't be used to discover which emails are registered.
+
+        Rate limited to 10 requests per 15 minutes per IP.
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email, example: ada@example.com }
+                password: { type: string, minLength: 1, example: Analytical-Engine-1843 }
+      responses:
+        '200':
+          description: Logged in
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/AuthResult' }
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Wrong email or password
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                message: Invalid email or password
+                errorCode: INVALID_CREDENTIALS
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      summary: Get a new access token
+      description: |
+        **Public** (the refresh token is the credential). Exchanges a valid,
+        unrevoked refresh token for a new access token. The refresh token itself
+        is not rotated and stays valid until it expires or is logged out.
+      operationId: refreshToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenBody'
+      responses:
+        '200':
+          description: New access token issued
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: object
+                        required: [accessToken]
+                        additionalProperties: false
+                        properties:
+                          accessToken:
+                            type: string
+                            example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIwYjZmN2MxZSJ9.Yc9mB2
+              example:
+                success: true
+                message: Token refreshed
+                data:
+                  accessToken: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIwYjZmN2MxZSJ9.Yc9mB2
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          description: Refresh token is malformed, expired, revoked (logged out), or its user no longer exists
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                revoked:
+                  summary: Logged out / expired
+                  value:
+                    success: false
+                    message: Refresh token is no longer valid
+                    errorCode: INVALID_REFRESH_TOKEN
+                malformed:
+                  summary: Not a valid refresh JWT
+                  value:
+                    success: false
+                    message: Invalid or expired refresh token
+                    errorCode: INVALID_REFRESH_TOKEN
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out (revoke a refresh token)
+      description: |
+        **Public** (the refresh token is the credential). Revokes the given
+        refresh token so it can no longer be used at `/auth/refresh`. Idempotent:
+        an unknown or already-revoked token also returns 200.
+
+        Already-issued access tokens remain valid until they expire (≤ 15 min).
+      operationId: logout
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshTokenBody'
+      responses:
+        '200':
+          $ref: '#/components/responses/SuccessNoData'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
+  # ────────────────────────────── Users ─────────────────────────────
+  /users/me:
+    get:
+      tags: [Users]
+      summary: Get my profile
+      description: '**Authenticated.**'
+      operationId: getMe
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          $ref: '#/components/responses/UserProfileOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+    patch:
+      tags: [Users]
+      summary: Update my profile
+      description: '**Authenticated.** Only the display name can be changed.'
+      operationId: updateMe
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 100, example: Ada King }
+      responses:
+        '200':
+          $ref: '#/components/responses/UserProfileOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /users:
+    get:
+      tags: [Users]
+      summary: List all users
+      description: '**Admin only.** Newest first.'
+      operationId: listUsers
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of users
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        allOf:
+                          - $ref: '#/components/schemas/PaginationMeta'
+                          - type: object
+                            required: [users]
+                            properties:
+                              users:
+                                type: array
+                                items: { $ref: '#/components/schemas/UserProfile' }
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+
+  /users/{id}:
+    get:
+      tags: [Users]
+      summary: Get a user by ID
+      description: '**Admin only.**'
+      operationId: getUserById
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      responses:
+        '200':
+          $ref: '#/components/responses/UserProfileOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+
+  /users/{id}/role:
+    patch:
+      tags: [Users]
+      summary: Change a user's role
+      description: |
+        **Admin only.** Promote a customer to admin or demote an admin to
+        customer. Takes effect on the user's next access token (existing tokens
+        keep their old role until they expire, ≤ 15 min).
+      operationId: updateUserRole
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/UserId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: { $ref: '#/components/schemas/Role' }
+      responses:
+        '200':
+          $ref: '#/components/responses/UserProfileOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+
+  # ─────────────────────────── Categories ───────────────────────────
+  /categories:
+    get:
+      tags: [Categories]
+      summary: List all categories
+      description: '**Public.** Alphabetical by name. Not paginated.'
+      operationId: listCategories
+      responses:
+        '200':
+          description: All categories
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Category' }
+    post:
+      tags: [Categories]
+      summary: Create a category
+      description: '**Admin only.** The slug is generated from the name.'
+      operationId: createCategory
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 100, example: Home Office }
+                description:
+                  type: string
+                  maxLength: 500
+                  example: Desks, chairs, and lighting for working from home.
+      responses:
+        '201':
+          $ref: '#/components/responses/CategoryOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '409':
+          $ref: '#/components/responses/CategoryExists'
+
+  /categories/{id}:
+    get:
+      tags: [Categories]
+      summary: Get a category
+      description: '**Public.**'
+      operationId: getCategory
+      parameters:
+        - $ref: '#/components/parameters/CategoryId'
+      responses:
+        '200':
+          $ref: '#/components/responses/CategoryOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/CategoryNotFound'
+    patch:
+      tags: [Categories]
+      summary: Update a category
+      description: '**Admin only.** Renaming also regenerates the slug.'
+      operationId: updateCategory
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/CategoryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 2, maxLength: 100, example: Home Office }
+                description: { type: string, maxLength: 500, example: Everything for your desk setup. }
+      responses:
+        '200':
+          $ref: '#/components/responses/CategoryOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/CategoryNotFound'
+        '409':
+          $ref: '#/components/responses/CategoryExists'
+    delete:
+      tags: [Categories]
+      summary: Delete a category
+      description: '**Admin only.** Refused while any product still belongs to the category.'
+      operationId: deleteCategory
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/CategoryId'
+      responses:
+        '200':
+          $ref: '#/components/responses/SuccessNoData'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/CategoryNotFound'
+        '409':
+          description: Category still has products
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                message: Cannot delete category with 3 product(s). Reassign or delete them first.
+                errorCode: CATEGORY_HAS_PRODUCTS
+
+  # ──────────────────────────── Products ────────────────────────────
+  /products:
+    get:
+      tags: [Products]
+      summary: List products
+      description: |
+        **Public.** Filter, search, sort, and paginate the catalog. All filters
+        combine with AND. Results are cached for up to 60 seconds; admin changes
+        invalidate the cache immediately.
+      operationId: listProducts
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+        - name: search
+          in: query
+          description: Case-insensitive substring match on name or description.
+          schema: { type: string, minLength: 1 }
+          example: lamp
+        - name: category
+          in: query
+          description: Category **slug** (not ID).
+          schema: { type: string, minLength: 1 }
+          example: home-office
+        - name: minPrice
+          in: query
+          description: Inclusive lower price bound.
+          schema: { type: number, minimum: 0 }
+          example: 20
+        - name: maxPrice
+          in: query
+          description: Inclusive upper price bound.
+          schema: { type: number, minimum: 0 }
+          example: 100
+        - name: sort
+          in: query
+          schema:
+            type: string
+            enum: [newest, oldest, price_asc, price_desc]
+            default: newest
+      responses:
+        '200':
+          description: A page of products
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        allOf:
+                          - $ref: '#/components/schemas/PaginationMeta'
+                          - type: object
+                            required: [products]
+                            properties:
+                              products:
+                                type: array
+                                items: { $ref: '#/components/schemas/Product' }
+        '400':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [Products]
+      summary: Create a product
+      description: |
+        **Admin only.** The slug is generated from the name and must be unique.
+        `categoryId` must reference an existing category. Upload images
+        separately via `POST /products/{id}/images`.
+      operationId: createProduct
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, price, stock, categoryId]
+              properties:
+                name: { type: string, minLength: 2, maxLength: 200, example: Brass Desk Lamp }
+                description:
+                  type: string
+                  maxLength: 2000
+                  example: Adjustable brass desk lamp with a warm 2700K LED bulb included.
+                price:
+                  type: number
+                  exclusiveMinimum: 0
+                  description: In USD. Stored with 2 decimal places.
+                  example: 49.99
+                stock: { type: integer, minimum: 0, example: 25 }
+                categoryId: { type: string, format: uuid, example: 5d1f0c3a-7e24-4b9a-8c61-2f3e9a7b0d45 }
+      responses:
+        '201':
+          $ref: '#/components/responses/ProductOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '409':
+          $ref: '#/components/responses/ProductExists'
+
+  /products/{id}:
+    get:
+      tags: [Products]
+      summary: Get a product
+      description: '**Public.** Cached for up to 5 minutes; admin changes invalidate it immediately.'
+      operationId: getProduct
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          $ref: '#/components/responses/ProductOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/ProductNotFound'
+    patch:
+      tags: [Products]
+      summary: Update a product
+      description: |
+        **Admin only.** Send only the fields to change. Renaming regenerates the
+        slug. Changing the price does not affect existing orders (order items
+        keep the price paid).
+      operationId: updateProduct
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string, minLength: 2, maxLength: 200, example: Brass Desk Lamp (2nd Gen) }
+                description: { type: string, maxLength: 2000 }
+                price: { type: number, exclusiveMinimum: 0, example: 44.99 }
+                stock: { type: integer, minimum: 0, example: 40 }
+                categoryId: { type: string, format: uuid }
+      responses:
+        '200':
+          $ref: '#/components/responses/ProductOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/ProductNotFound'
+        '409':
+          $ref: '#/components/responses/ProductExists'
+    delete:
+      tags: [Products]
+      summary: Delete a product
+      description: |
+        **Admin only.** Also deletes the product's images from Cloudinary and
+        removes it from every cart. Products that appear in past orders cannot
+        currently be deleted.
+      operationId: deleteProduct
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      responses:
+        '200':
+          $ref: '#/components/responses/SuccessNoData'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/ProductNotFound'
+
+  /products/{id}/images:
+    post:
+      tags: [Products]
+      summary: Upload a product image
+      description: |
+        **Admin only.** `multipart/form-data` with a single file in the `image`
+        field. JPEG, PNG, or WEBP; up to 5 MB; at most 5 images per product.
+        The image is stored on Cloudinary. Returns the updated product.
+      operationId: uploadProductImage
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+                  description: JPEG, PNG, or WEBP, max 5 MB.
+            encoding:
+              image:
+                contentType: image/jpeg, image/png, image/webp
+      responses:
+        '201':
+          $ref: '#/components/responses/ProductOk'
+        '400':
+          description: No file, wrong file type, or the product already has 5 images
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                noFile:
+                  value: { success: false, message: No image file provided, errorCode: NO_FILE_PROVIDED }
+                wrongType:
+                  value:
+                    success: false
+                    message: Only JPEG, PNG, and WEBP images are allowed
+                    errorCode: INVALID_FILE_TYPE
+                tooMany:
+                  value:
+                    success: false
+                    message: Maximum of 5 images per product
+                    errorCode: MAX_IMAGES_REACHED
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/ProductNotFound'
+
+  /products/{id}/images/{imageId}:
+    delete:
+      tags: [Products]
+      summary: Delete a product image
+      description: '**Admin only.** Removes the image from Cloudinary and from the product.'
+      operationId: deleteProductImage
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/ProductId'
+        - name: imageId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+          example: e2a9c4d7-1b3f-4e8a-a5c6-7d0f2b9e4c13
+      responses:
+        '200':
+          $ref: '#/components/responses/SuccessNoData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          description: Image not found on this product
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example: { success: false, message: Image not found, errorCode: IMAGE_NOT_FOUND }
+
+  # ───────────────────────────── Reviews ────────────────────────────
+  /products/{productId}/reviews:
+    get:
+      tags: [Reviews]
+      summary: List a product's reviews
+      description: '**Public.** Newest first.'
+      operationId: listReviews
+      parameters:
+        - $ref: '#/components/parameters/ReviewProductId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of reviews
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        allOf:
+                          - $ref: '#/components/schemas/PaginationMeta'
+                          - type: object
+                            required: [reviews]
+                            properties:
+                              reviews:
+                                type: array
+                                items: { $ref: '#/components/schemas/Review' }
+        '400':
+          $ref: '#/components/responses/ValidationError'
+    post:
+      tags: [Reviews]
+      summary: Review a product
+      description: |
+        **Authenticated.** Only verified purchasers may review: the user must
+        have an order containing this product with status `PAID`, `SHIPPED`, or
+        `DELIVERED` (pending and cancelled orders don't count). One review per
+        user per product — edit the existing one with `PATCH /reviews/{id}`.
+      operationId: createReview
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ReviewProductId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5, example: 5 }
+                comment:
+                  type: string
+                  maxLength: 1000
+                  example: Warm light, solid build, and the arm holds its position well.
+      responses:
+        '201':
+          $ref: '#/components/responses/ReviewOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: The user has not purchased this product
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                message: You can only review products you have purchased
+                errorCode: PRODUCT_NOT_PURCHASED
+        '404':
+          $ref: '#/components/responses/ProductNotFound'
+        '409':
+          description: The user already reviewed this product
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                message: You have already reviewed this product
+                errorCode: REVIEW_ALREADY_EXISTS
+
+  /reviews/{id}:
+    patch:
+      tags: [Reviews]
+      summary: Edit my review
+      description: '**Authenticated** — author only. Admins cannot edit other users'' reviews (they can delete them).'
+      operationId: updateReview
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ReviewId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5, example: 4 }
+                comment:
+                  type: string
+                  maxLength: 1000
+                  example: Update after 3 months — the switch has started to stick.
+      responses:
+        '200':
+          $ref: '#/components/responses/ReviewOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/NotOwner'
+        '404':
+          $ref: '#/components/responses/ReviewNotFound'
+    delete:
+      tags: [Reviews]
+      summary: Delete a review
+      description: '**Authenticated** — the author, or any admin (moderation).'
+      operationId: deleteReview
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/ReviewId'
+      responses:
+        '200':
+          $ref: '#/components/responses/SuccessNoData'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/NotOwner'
+        '404':
+          $ref: '#/components/responses/ReviewNotFound'
+
+  # ────────────────────────────── Cart ──────────────────────────────
+  /cart:
+    get:
+      tags: [Cart]
+      summary: Get my cart
+      description: '**Authenticated.** Created empty on first access. Prices are current catalog prices.'
+      operationId: getCart
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          $ref: '#/components/responses/CartOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    delete:
+      tags: [Cart]
+      summary: Empty my cart
+      description: '**Authenticated.**'
+      operationId: clearCart
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          $ref: '#/components/responses/CartOk'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /cart/items:
+    post:
+      tags: [Cart]
+      summary: Add a product to my cart
+      description: |
+        **Authenticated.** If the product is already in the cart, the quantity is
+        **added** to the existing quantity. The combined quantity must not exceed
+        current stock. (Stock is checked again, atomically, at checkout.)
+      operationId: addCartItem
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [productId, quantity]
+              properties:
+                productId: { type: string, format: uuid, example: 9c4e2b7a-1d3f-4a8e-b6c5-0f2d7e9a3b18 }
+                quantity: { type: integer, minimum: 1, example: 2 }
+      responses:
+        '201':
+          $ref: '#/components/responses/CartOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/ProductNotFound'
+        '409':
+          $ref: '#/components/responses/InsufficientStock'
+
+  /cart/items/{productId}:
+    patch:
+      tags: [Cart]
+      summary: Set the quantity of a cart item
+      description: '**Authenticated.** Replaces (does not add to) the quantity.'
+      operationId: updateCartItem
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/CartProductId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [quantity]
+              properties:
+                quantity: { type: integer, minimum: 1, example: 3 }
+      responses:
+        '200':
+          $ref: '#/components/responses/CartOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/CartItemNotFound'
+        '409':
+          $ref: '#/components/responses/InsufficientStock'
+    delete:
+      tags: [Cart]
+      summary: Remove a product from my cart
+      description: '**Authenticated.**'
+      operationId: removeCartItem
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/CartProductId'
+      responses:
+        '200':
+          $ref: '#/components/responses/CartOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/CartItemNotFound'
+
+  # ───────────────────────────── Orders ─────────────────────────────
+  /orders:
+    post:
+      tags: [Orders]
+      summary: Place an order from my cart
+      description: |
+        **Authenticated.** Checks out the entire cart in one database
+        transaction: stock is reserved for every item, the order and its items
+        are created at current prices, and the cart is emptied. If any item is
+        short on stock, nothing is changed. Concurrent checkouts can never
+        oversell: the stock check and decrement are a single atomic update.
+
+        The order starts as `PENDING`; pay for it with
+        `POST /payments/create-intent`. A confirmation email is queued.
+      operationId: createOrder
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [shippingAddress]
+              properties:
+                shippingAddress:
+                  type: string
+                  minLength: 10
+                  maxLength: 500
+                  example: 42 Wallaby Way, Sydney NSW 2000, Australia
+      responses:
+        '201':
+          $ref: '#/components/responses/OrderOk'
+        '400':
+          description: Validation error, or the cart is empty
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                emptyCart:
+                  value: { success: false, message: Cart is empty, errorCode: CART_EMPTY }
+                validation:
+                  value:
+                    success: false
+                    message: 'body.shippingAddress: Shipping address is too short'
+                    errorCode: VALIDATION_ERROR
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Not enough stock for at least one item (someone else bought it first)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                message: Insufficient stock for one or more items in your cart (product 9c4e2b7a-1d3f-4a8e-b6c5-0f2d7e9a3b18)
+                errorCode: INSUFFICIENT_STOCK
+    get:
+      tags: [Orders]
+      summary: List my orders
+      description: '**Authenticated.** Only the caller''s own orders (admins included), newest first.'
+      operationId: listOrders
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: A page of orders
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data:
+                        allOf:
+                          - $ref: '#/components/schemas/PaginationMeta'
+                          - type: object
+                            required: [orders]
+                            properties:
+                              orders:
+                                type: array
+                                items: { $ref: '#/components/schemas/Order' }
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get an order
+      description: '**Authenticated** — the order''s owner, or any admin.'
+      operationId: getOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OrderOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/NotOwner'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+
+  /orders/{id}/cancel:
+    patch:
+      tags: [Orders]
+      summary: Cancel my order
+      description: |
+        **Authenticated** — the order's owner only. Only `PENDING` (unpaid)
+        orders can be cancelled.
+      operationId: cancelOrder
+      security: [{ bearerAuth: [] }]
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          $ref: '#/components/responses/OrderOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/NotOwner'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '409':
+          description: Order is no longer PENDING
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                message: Cannot cancel an order with status SHIPPED
+                errorCode: INVALID_ORDER_STATUS
+
+  /orders/{id}/status:
+    patch:
+      tags: [Orders]
+      summary: Advance an order's status
+      description: |
+        **Admin only.** Allowed transitions:
+
+        | From | To |
+        |---|---|
+        | `PENDING` | `PAID`, `CANCELLED` |
+        | `PAID` | `SHIPPED` |
+        | `SHIPPED` | `DELIVERED` |
+        | `DELIVERED`, `CANCELLED` | *(final)* |
+
+        Normally `PENDING → PAID` happens automatically via the Stripe webhook.
+      operationId: updateOrderStatus
+      security: [{ bearerAuth: [] }]
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status: { $ref: '#/components/schemas/OrderStatus' }
+            example: { status: SHIPPED }
+      responses:
+        '200':
+          $ref: '#/components/responses/OrderOk'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/AdminOnly'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '409':
+          description: Transition not allowed from the current status
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              example:
+                success: false
+                message: Cannot transition order from PENDING to SHIPPED
+                errorCode: INVALID_STATUS_TRANSITION
+
+  # ──────────────────────────── Payments ────────────────────────────
+  /payments/create-intent:
+    post:
+      tags: [Payments]
+      summary: Start paying for an order
+      description: |
+        **Authenticated** — the order's owner only. Creates a Stripe
+        PaymentIntent for the order total and returns its `clientSecret`; the
+        client confirms payment with Stripe.js. The order becomes `PAID` when
+        Stripe calls the webhook — not when this endpoint returns.
+
+        Calling again for the same order (e.g. after a declined card) creates a
+        new PaymentIntent and replaces the previous one.
+
+        Rate limited to 10 requests per minute per IP.
+      operationId: createPaymentIntent
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId]
+              properties:
+                orderId: { type: string, format: uuid, example: 7a2d9e4b-6c1f-4b3a-8e5d-2f9c0a7b1e64 }
+      responses:
+        '201':
+          description: PaymentIntent created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - properties:
+                      data: { $ref: '#/components/schemas/PaymentIntentResult' }
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/NotOwner'
+        '404':
+          $ref: '#/components/responses/OrderNotFound'
+        '409':
+          description: Order is not payable
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                notPending:
+                  value:
+                    success: false
+                    message: Cannot create a payment for an order with status CANCELLED
+                    errorCode: INVALID_ORDER_STATUS
+                alreadyPaid:
+                  value:
+                    success: false
+                    message: This order has already been paid
+                    errorCode: ORDER_ALREADY_PAID
+        '429':
+          $ref: '#/components/responses/RateLimited'
+
+  /payments/webhook:
+    post:
+      tags: [Payments]
+      summary: Stripe webhook receiver
+      description: |
+        **Called by Stripe, not by clients.** Authenticated by the
+        `Stripe-Signature` header (HMAC of the raw body with the webhook
+        signing secret), not by a bearer token.
+
+        ### Raw body required
+        Unlike every other endpoint, this route reads the body as **raw bytes**
+        (it's mounted before the JSON parser). The signature covers the exact
+        bytes Stripe sent, so any proxy or middleware that parses and
+        re-serializes the JSON will break verification. For the same reason,
+        **"Try it out" below will always get a 400** — use the Stripe CLI
+        instead: `stripe listen --forward-to localhost:5000/api/payments/webhook`.
+
+        ### Handled events
+        | Event | Effect |
+        |---|---|
+        | `payment_intent.succeeded` | Payment → `SUCCEEDED`, order → `PAID`, confirmation email queued |
+        | `payment_intent.payment_failed` | Payment → `FAILED`; order stays `PENDING` so the customer can retry |
+        | anything else | Acknowledged and ignored |
+
+        Handling is idempotent: redelivered events cause no duplicate updates or emails.
+
+        The response is `{ "received": true }`, **not** the standard envelope.
+      operationId: stripeWebhook
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: true
+          description: Set by Stripe on every webhook request.
+          schema: { type: string }
+          example: t=1792588800,v1=5257a869e7ecebeda32affa62cdca3fa51cad7e77a0e56ff536d0ce8e108d8bd
+      requestBody:
+        required: true
+        description: A Stripe Event object, as raw JSON bytes.
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StripeEvent' }
+      responses:
+        '200':
+          description: Event verified and processed (or intentionally ignored)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [received]
+                additionalProperties: false
+                properties:
+                  received: { const: true }
+        '400':
+          description: Missing or invalid signature
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorResponse' }
+              examples:
+                missing:
+                  value: { success: false, message: Missing Stripe signature header, errorCode: MISSING_SIGNATURE }
+                invalid:
+                  value: { success: false, message: Invalid webhook signature, errorCode: INVALID_WEBHOOK_SIGNATURE }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token from `/auth/login` or `/auth/register` (valid 15 minutes).
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      name: limit
+      in: query
+      description: Page size.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    UserId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      example: 0b6f7c1e-3a52-4d8e-9f10-6c2d4b8a7e31
+    CategoryId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      example: 5d1f0c3a-7e24-4b9a-8c61-2f3e9a7b0d45
+    ProductId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      example: 9c4e2b7a-1d3f-4a8e-b6c5-0f2d7e9a3b18
+    ReviewProductId:
+      name: productId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      example: 9c4e2b7a-1d3f-4a8e-b6c5-0f2d7e9a3b18
+    CartProductId:
+      name: productId
+      in: path
+      required: true
+      description: The product's ID (not the cart item's ID).
+      schema: { type: string, format: uuid }
+      example: 9c4e2b7a-1d3f-4a8e-b6c5-0f2d7e9a3b18
+    OrderId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      example: 7a2d9e4b-6c1f-4b3a-8e5d-2f9c0a7b1e64
+    ReviewId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+      example: 3e8b1f6d-2c4a-4d7e-9b0f-5a6c8d2e1f93
+
+  responses:
+    # ── Shared success responses ──
+    SuccessNoData:
+      description: Success (no payload)
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { type: 'null' }
+          example: { success: true, message: Deleted successfully, data: null }
+    UserProfileOk:
+      description: User profile
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/UserProfile' }
+    CategoryOk:
+      description: Category
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Category' }
+    ProductOk:
+      description: Product
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Product' }
+    CartOk:
+      description: The cart after the operation
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Cart' }
+    OrderOk:
+      description: Order
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Order' }
+    ReviewOk:
+      description: Review
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: '#/components/schemas/SuccessEnvelope'
+              - properties:
+                  data: { $ref: '#/components/schemas/Review' }
+
+    # ── Shared error responses ──
+    ValidationError:
+      description: Request failed validation
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            success: false
+            message: 'body.email: Invalid email address, body.password: Password must be at least 8 characters'
+            errorCode: VALIDATION_ERROR
+    Unauthorized:
+      description: Missing, invalid, or expired access token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          examples:
+            missing:
+              value: { success: false, message: Authentication required, errorCode: UNAUTHORIZED }
+            invalid:
+              value: { success: false, message: Invalid or expired access token, errorCode: INVALID_ACCESS_TOKEN }
+    AdminOnly:
+      description: Caller is not an admin
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            success: false
+            message: You do not have permission to perform this action
+            errorCode: FORBIDDEN
+    NotOwner:
+      description: The resource belongs to another user
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            success: false
+            message: You do not have permission to view this order
+            errorCode: FORBIDDEN
+    RateLimited:
+      description: Too many requests from this IP
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example:
+            success: false
+            message: Too many requests. Please try again later.
+            errorCode: RATE_LIMIT_EXCEEDED
+    InsufficientStock:
+      description: Requested quantity exceeds available stock
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { success: false, message: Only 3 unit(s) available in stock, errorCode: INSUFFICIENT_STOCK }
+    UserNotFound:
+      description: User not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { success: false, message: User not found, errorCode: USER_NOT_FOUND }
+    CategoryNotFound:
+      description: Category not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { success: false, message: Category not found, errorCode: CATEGORY_NOT_FOUND }
+    CategoryExists:
+      description: Another category already has this name (slug)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { success: false, message: A category with this name already exists, errorCode: CATEGORY_EXISTS }
+    ProductNotFound:
+      description: Product not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { success: false, message: Product not found, errorCode: PRODUCT_NOT_FOUND }
+    ProductExists:
+      description: Another product already has this name (slug)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { success: false, message: A product with this name already exists, errorCode: PRODUCT_EXISTS }
+    CartItemNotFound:
+      description: Product is not in the cart
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { success: false, message: Item not found in cart, errorCode: CART_ITEM_NOT_FOUND }
+    OrderNotFound:
+      description: Order not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { success: false, message: Order not found, errorCode: ORDER_NOT_FOUND }
+    ReviewNotFound:
+      description: Review not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorResponse' }
+          example: { success: false, message: Review not found, errorCode: REVIEW_NOT_FOUND }
+
+  schemas:
+    # ── Envelopes ──
+    SuccessEnvelope:
+      type: object
+      required: [success, message, data]
+      properties:
+        success: { const: true }
+        message: { type: string, example: Success }
+        data: {}
+    ErrorResponse:
+      type: object
+      required: [success, message, errorCode]
+      additionalProperties: false
+      properties:
+        success: { const: false }
+        message: { type: string, example: Product not found }
+        errorCode: { type: string, example: PRODUCT_NOT_FOUND }
+    PaginationMeta:
+      type: object
+      required: [total, page, limit, totalPages]
+      properties:
+        total: { type: integer, description: Total matching items across all pages., example: 42 }
+        page: { type: integer, example: 1 }
+        limit: { type: integer, example: 20 }
+        totalPages: { type: integer, example: 3 }
+
+    # ── Auth & users ──
+    Role:
+      type: string
+      enum: [CUSTOMER, ADMIN]
+    AuthUser:
+      type: object
+      required: [id, name, email, role]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: 0b6f7c1e-3a52-4d8e-9f10-6c2d4b8a7e31 }
+        name: { type: string, example: Ada Lovelace }
+        email: { type: string, format: email, example: ada@example.com }
+        role: { $ref: '#/components/schemas/Role' }
+    AuthResult:
+      type: object
+      required: [user, tokens]
+      additionalProperties: false
+      properties:
+        user: { $ref: '#/components/schemas/AuthUser' }
+        tokens:
+          type: object
+          required: [accessToken, refreshToken]
+          additionalProperties: false
+          properties:
+            accessToken: { type: string, description: 'JWT, valid 15 minutes.' }
+            refreshToken: { type: string, description: 'JWT, valid 7 days or until logout.' }
+    RefreshTokenBody:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+          minLength: 1
+          example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIwYjZmN2MxZSIsImp0aSI6IjdhMWMifQ.pQ3r8Zt0sL
+    UserProfile:
+      type: object
+      required: [id, name, email, role, createdAt]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: 0b6f7c1e-3a52-4d8e-9f10-6c2d4b8a7e31 }
+        name: { type: string, example: Ada Lovelace }
+        email: { type: string, format: email, example: ada@example.com }
+        role: { $ref: '#/components/schemas/Role' }
+        createdAt: { type: string, format: date-time, example: '2026-09-20T14:03:11.000Z' }
+
+    # ── Catalog ──
+    Category:
+      type: object
+      required: [id, name, slug, description, createdAt, updatedAt]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: 5d1f0c3a-7e24-4b9a-8c61-2f3e9a7b0d45 }
+        name: { type: string, example: Home Office }
+        slug: { type: string, example: home-office }
+        description:
+          type: [string, 'null']
+          example: Desks, chairs, and lighting for working from home.
+        createdAt: { type: string, format: date-time, example: '2026-09-01T09:00:00.000Z' }
+        updatedAt: { type: string, format: date-time, example: '2026-09-01T09:00:00.000Z' }
+    ProductImage:
+      type: object
+      required: [id, url, publicId]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: e2a9c4d7-1b3f-4e8a-a5c6-7d0f2b9e4c13 }
+        url:
+          type: string
+          format: uri
+          example: https://res.cloudinary.com/demo/image/upload/v1792588800/ecommerce/products/brass-lamp.jpg
+        publicId: { type: string, example: ecommerce/products/brass-lamp }
+    Product:
+      type: object
+      required: [id, name, slug, description, price, stock, categoryId, category, images, createdAt, updatedAt]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: 9c4e2b7a-1d3f-4a8e-b6c5-0f2d7e9a3b18 }
+        name: { type: string, example: Brass Desk Lamp }
+        slug: { type: string, example: brass-desk-lamp }
+        description:
+          type: [string, 'null']
+          example: Adjustable brass desk lamp with a warm 2700K LED bulb included.
+        price: { type: number, description: USD, example: 49.99 }
+        stock: { type: integer, example: 25 }
+        categoryId: { type: string, format: uuid, example: 5d1f0c3a-7e24-4b9a-8c61-2f3e9a7b0d45 }
+        category:
+          type: object
+          required: [id, name, slug]
+          additionalProperties: false
+          properties:
+            id: { type: string, format: uuid, example: 5d1f0c3a-7e24-4b9a-8c61-2f3e9a7b0d45 }
+            name: { type: string, example: Home Office }
+            slug: { type: string, example: home-office }
+        images:
+          type: array
+          items: { $ref: '#/components/schemas/ProductImage' }
+        createdAt: { type: string, format: date-time, example: '2026-09-10T11:30:00.000Z' }
+        updatedAt: { type: string, format: date-time, example: '2026-09-18T16:45:00.000Z' }
+
+    # ── Cart ──
+    CartItem:
+      type: object
+      required: [id, productId, productName, productSlug, price, quantity, subtotal, imageUrl]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: 1f7a3c9e-5b2d-4e6a-8c0f-9d4b2e7a6c35 }
+        productId: { type: string, format: uuid, example: 9c4e2b7a-1d3f-4a8e-b6c5-0f2d7e9a3b18 }
+        productName: { type: string, example: Brass Desk Lamp }
+        productSlug: { type: string, example: brass-desk-lamp }
+        price: { type: number, description: Current unit price (USD)., example: 49.99 }
+        quantity: { type: integer, example: 2 }
+        subtotal: { type: number, example: 99.98 }
+        imageUrl:
+          type: [string, 'null']
+          description: The product's first image, if any.
+          example: https://res.cloudinary.com/demo/image/upload/v1792588800/ecommerce/products/brass-lamp.jpg
+    Cart:
+      type: object
+      required: [id, items, totalItems, totalAmount]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: 6b0e4d2a-9c7f-4a1e-b3d5-8f2c6a0e7d49 }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CartItem' }
+        totalItems: { type: integer, description: Sum of quantities., example: 2 }
+        totalAmount: { type: number, description: USD., example: 99.98 }
+
+    # ── Orders ──
+    OrderStatus:
+      type: string
+      enum: [PENDING, PAID, SHIPPED, DELIVERED, CANCELLED]
+    OrderItem:
+      type: object
+      required: [id, productId, productName, quantity, price, subtotal]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: 4c9e1a7d-3b5f-4d2e-a8c6-0e7b9f1d3a52 }
+        productId: { type: string, format: uuid, example: 9c4e2b7a-1d3f-4a8e-b6c5-0f2d7e9a3b18 }
+        productName: { type: string, example: Brass Desk Lamp }
+        quantity: { type: integer, example: 2 }
+        price: { type: number, description: Unit price at the time of purchase (USD)., example: 49.99 }
+        subtotal: { type: number, example: 99.98 }
+    Order:
+      type: object
+      required: [id, userId, status, totalAmount, shippingAddress, items, createdAt, updatedAt]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: 7a2d9e4b-6c1f-4b3a-8e5d-2f9c0a7b1e64 }
+        userId: { type: string, format: uuid, example: 0b6f7c1e-3a52-4d8e-9f10-6c2d4b8a7e31 }
+        status: { $ref: '#/components/schemas/OrderStatus' }
+        totalAmount: { type: number, description: USD., example: 99.98 }
+        shippingAddress: { type: string, example: '42 Wallaby Way, Sydney NSW 2000, Australia' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OrderItem' }
+        createdAt: { type: string, format: date-time, example: '2026-09-26T10:15:00.000Z' }
+        updatedAt: { type: string, format: date-time, example: '2026-09-26T10:15:00.000Z' }
+
+    # ── Payments ──
+    PaymentIntentResult:
+      type: object
+      required: [clientSecret, paymentId, amount, currency]
+      additionalProperties: false
+      properties:
+        clientSecret:
+          type: string
+          description: Pass to Stripe.js `confirmCardPayment` / Payment Element. Never log or store it.
+          example: pi_3Q8xYz2eZvKYlo2C1a2b3c4d_secret_Kq9L0mN1oP2qR3sT4uV5
+        paymentId: { type: string, description: Stripe PaymentIntent ID., example: pi_3Q8xYz2eZvKYlo2C1a2b3c4d }
+        amount: { type: number, description: USD (Stripe is charged the equivalent in cents)., example: 99.98 }
+        currency: { type: string, example: usd }
+    StripeEvent:
+      type: object
+      description: A Stripe Event. Only the fields this API reads are listed.
+      required: [id, type, data]
+      properties:
+        id: { type: string, example: evt_3Q8xYz2eZvKYlo2C0x1y2z3a }
+        type: { type: string, example: payment_intent.succeeded }
+        data:
+          type: object
+          required: [object]
+          properties:
+            object:
+              type: object
+              properties:
+                id: { type: string, example: pi_3Q8xYz2eZvKYlo2C1a2b3c4d }
+
+    # ── Reviews ──
+    Review:
+      type: object
+      required: [id, userId, userName, productId, rating, comment, createdAt, updatedAt]
+      additionalProperties: false
+      properties:
+        id: { type: string, format: uuid, example: 3e8b1f6d-2c4a-4d7e-9b0f-5a6c8d2e1f93 }
+        userId: { type: string, format: uuid, example: 0b6f7c1e-3a52-4d8e-9f10-6c2d4b8a7e31 }
+        userName: { type: string, example: Ada Lovelace }
+        productId: { type: string, format: uuid, example: 9c4e2b7a-1d3f-4a8e-b6c5-0f2d7e9a3b18 }
+        rating: { type: integer, minimum: 1, maximum: 5, example: 5 }
+        comment:
+          type: [string, 'null']
+          example: Warm light, solid build, and the arm holds its position well.
+        createdAt: { type: string, format: date-time, example: '2026-10-02T18:20:00.000Z' }
+        updatedAt: { type: string, format: date-time, example: '2026-10-02T18:20:00.000Z' }
