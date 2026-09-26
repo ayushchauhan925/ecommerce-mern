@@ -10,25 +10,21 @@
  * `npm test` passes --runInBand.
  */
 
-/** @type {import('ts-jest').TsJestTransformerOptions} */
-const tsJestOptions = { tsconfig: '<rootDir>/tsconfig.test.json' };
-
 const shared = {
   testEnvironment: 'node',
-  transform: { '^.+\\.ts$': ['ts-jest', tsJestOptions] },
-  moduleFileExtensions: ['ts', 'js', 'json'],
+  moduleFileExtensions: ['js', 'json'],
   clearMocks: true,
 };
 
 /** @type {import('jest').Config} */
 module.exports = {
   collectCoverageFrom: [
-    'src/**/*.ts',
+    'src/**/*.js',
     // Process bootstrap and BullMQ workers need a live Redis and aren't
     // exercised by this suite; excluding them keeps the coverage number honest
     // about what the tests actually cover.
-    '!src/server.ts',
-    '!src/jobs/*.worker.ts',
+    '!src/server.js',
+    '!src/jobs/*.worker.js',
   ],
   coverageDirectory: 'coverage',
   coverageReporters: ['text-summary', 'text', 'lcov'],
@@ -37,18 +33,18 @@ module.exports = {
       ...shared,
       displayName: 'unit',
       roots: ['<rootDir>/tests/unit'],
-      setupFiles: ['<rootDir>/tests/setup/env.ts'],
-      setupFilesAfterEnv: ['<rootDir>/tests/setup/silenceLogger.ts'],
+      setupFiles: ['<rootDir>/tests/setup/env.js'],
+      setupFilesAfterEnv: ['<rootDir>/tests/setup/silenceLogger.js'],
     },
     {
       ...shared,
       displayName: 'integration',
       roots: ['<rootDir>/tests/integration'],
-      globalSetup: '<rootDir>/tests/setup/globalSetup.ts',
-      setupFiles: ['<rootDir>/tests/setup/env.ts'],
+      globalSetup: '<rootDir>/tests/setup/globalSetup.js',
+      setupFiles: ['<rootDir>/tests/setup/env.js'],
       setupFilesAfterEnv: [
-        '<rootDir>/tests/setup/silenceLogger.ts',
-        '<rootDir>/tests/setup/integration.ts',
+        '<rootDir>/tests/setup/silenceLogger.js',
+        '<rootDir>/tests/setup/integration.js',
       ],
     },
   ],
